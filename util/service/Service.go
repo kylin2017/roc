@@ -7,15 +7,23 @@ package rocserv
 import (
 	"flag"
 	"fmt"
+	"os"
+	"os/signal"
+	"reflect"
+	"strings"
+	"sync"
+	"syscall"
+
+	stat "gitlab.pri.ibanyu.com/middleware/seaweed/xstat/sys"
+
 	"git.apache.org/thrift.git/lib/go/thrift"
 	"github.com/gin-gonic/gin"
 	"github.com/julienschmidt/httprouter"
 	"github.com/shawnfeng/sutil/slog"
 	"github.com/shawnfeng/sutil/slog/statlog"
-	"github.com/shawnfeng/sutil/smetric"
 	"github.com/shawnfeng/sutil/trace"
-	"reflect"
-	"sync"
+
+	xprom "gitlab.pri.ibanyu.com/middleware/seaweed/xstat/xmetric/xprometheus"
 )
 
 const (
@@ -23,6 +31,9 @@ const (
 	PROCESSOR_THRIFT = "thrift"
 	PROCESSOR_GRPC   = "gprc"
 	PROCESSOR_GIN    = "gin"
+
+	MODEL_SERVER      = 0
+	MODEL_MASTERSLAVE = 1
 )
 
 var service = NewService()
@@ -46,17 +57,21 @@ type cmdArgs struct {
 	servLoc       string
 	logDir        string
 	sessKey       string
+	sidOffset     int
 	group         string
+	disable       bool
+	model         int
 }
 
 func (m *Service) parseFlag() (*cmdArgs, error) {
 	var serv, logDir, skey, group string
-	var logMaxSize, logMaxBackups int
+	var logMaxSize, logMaxBackups, sidOffset int
 	flag.IntVar(&logMaxSize, "logmaxsize", 0, "logMaxSize is the maximum size in megabytes of the log file")
 	flag.IntVar(&logMaxBackups, "logmaxbackups", 0, "logmaxbackups is the maximum number of old log files to retain")
 	flag.StringVar(&serv, "serv", "", "servic name")
 	flag.StringVar(&logDir, "logdir", "", "serice log dir")
 	flag.StringVar(&skey, "skey", "", "service session key")
+	flag.IntVar(&sidOffset, "sidoffset", 0, "service id offset for different data center")
 	flag.StringVar(&group, "group", "", "service group")
 
 	flag.Parse()
@@ -75,6 +90,7 @@ func (m *Service) parseFlag() (*cmdArgs, error) {
 		servLoc:       serv,
 		logDir:        logDir,
 		sessKey:       skey,
+		sidOffset:     sidOffset,
 		group:         group,
 	}, nil
 
@@ -227,16 +243,32 @@ func (m *Service) Init(confEtcd configEtcd, args *cmdArgs, initfn func(ServBase)
 	servLoc := args.servLoc
 	sessKey := args.sessKey
 
-	sb, err := NewServBaseV2(confEtcd, servLoc, sessKey)
+	sb, err := NewServBaseV2(confEtcd, servLoc, sessKey, args.group, args.sidOffset)
 	if err != nil {
 		slog.Panicf("%s init servbase loc:%s key:%s err:%s", fun, servLoc, sessKey, err)
 		return err
 	}
+	m.sbase = sb
 
+	// 初始化日志
 	m.initLog(sb, args)
+
+	// 初始化服务进程打点
+	stat.Init(sb.servGroup, sb.servName, "")
+
 	defer slog.Sync()
 	defer statlog.Sync()
 
+	// NOTE: initBackdoork会启动http服务，但由于health check的http请求不需要追踪，且它是判断服务启动与否的关键，所以initTracer可以放在它之后进行
+	m.initBackdoork(sb)
+
+	err = m.handleModel(sb, servLoc, args.model)
+	if err != nil {
+		slog.Panicf("%s handleModel err:%s", fun, err)
+		return err
+	}
+
+	// App层初始化
 	err = initfn(sb)
 	if err != nil {
 		slog.Panicf("%s callInitFunc err:%s", fun, err)
@@ -252,13 +284,46 @@ func (m *Service) Init(confEtcd configEtcd, args *cmdArgs, initfn func(ServBase)
 		return err
 	}
 
-	sb.SetGroup(args.group)
-
-	m.initBackdoork(sb)
+	sb.SetGroupAndDisable(args.group, args.disable)
 	m.initMetric(sb)
+	m.awaitSignal(sb)
 
-	var pause chan bool
-	pause <- true
+	return nil
+}
+
+func (m *Service) awaitSignal(sb *ServBaseV2) {
+	c := make(chan os.Signal, 1)
+	signals := []os.Signal{syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGPIPE}
+	signal.Reset(signals...)
+	signal.Notify(c, signals...)
+
+	for {
+		select {
+		case s := <-c:
+			slog.Infof("receive a signal:%s", s.String())
+
+			if s.String() == syscall.SIGTERM.String() {
+				slog.Infof("receive a signal:%s, stop service", s.String())
+				sb.Stop()
+				<-(chan int)(nil)
+			}
+		}
+	}
+
+}
+
+func (m *Service) handleModel(sb *ServBaseV2, servLoc string, model int) error {
+	fun := "Service.handleModel -->"
+
+	if model == MODEL_MASTERSLAVE {
+		lockKey := fmt.Sprintf("%s-master-slave", servLoc)
+		if err := sb.LockGlobal(lockKey); err != nil {
+			slog.Errorf("%s LockGlobal key: %s, err: %s", fun, lockKey, err)
+			return err
+		}
+
+		slog.Infof("%s LockGlobal succ, key: %s", fun, lockKey)
+	}
 
 	return nil
 }
@@ -301,6 +366,13 @@ func (m *Service) initProcessor(sb *ServBaseV2, procs map[string]Processor) erro
 		return err
 	}
 
+	// 注册跨机房服务
+	err = sb.RegisterCrossDCService(infos)
+	if err != nil {
+		slog.Errorf("%s register cross dc failed, err: %v", fun, err)
+		return err
+	}
+
 	return nil
 }
 
@@ -310,6 +382,11 @@ func (m *Service) initTracer(servLoc string) error {
 	err := trace.InitDefaultTracer(servLoc)
 	if err != nil {
 		slog.Errorf("%s init tracer fail:%v", fun, err)
+	}
+
+	err = trace.InitTraceSpanFilter()
+	if err != nil {
+		slog.Errorf("%s init trace span filter fail: %s", fun, err.Error())
 	}
 
 	return err
@@ -329,7 +406,7 @@ func (m *Service) initBackdoork(sb *ServBaseV2) error {
 	if err == nil {
 		err = sb.RegisterBackDoor(binfos)
 		if err != nil {
-			slog.Errorf("%s regist backdoor err:%s", fun, err)
+			slog.Errorf("%s register backdoor err:%s", fun, err)
 		}
 
 	} else {
@@ -342,7 +419,7 @@ func (m *Service) initBackdoork(sb *ServBaseV2) error {
 func (m *Service) initMetric(sb *ServBaseV2) error {
 	fun := "Service.initMetric -->"
 
-	metrics := smetric.NewMetricsprocessor()
+	metrics := xprom.NewMetricProcessor()
 	err := metrics.Init()
 	if err != nil {
 		slog.Warnf("%s init metrics err:%s", fun, err)
@@ -352,7 +429,7 @@ func (m *Service) initMetric(sb *ServBaseV2) error {
 	if err == nil {
 		err = sb.RegisterMetrics(minfos)
 		if err != nil {
-			slog.Warnf("%s regist backdoor err:%s", fun, err)
+			slog.Warnf("%s register backdoor err:%s", fun, err)
 		}
 
 	} else {
@@ -367,6 +444,23 @@ func ReloadRouter(processor string, driver interface{}) error {
 
 func Serve(etcds []string, baseLoc string, initfn func(ServBase) error, procs map[string]Processor) error {
 	return service.Serve(configEtcd{etcds, baseLoc}, initfn, procs)
+}
+
+func MasterSlave(etcds []string, baseLoc string, initfn func(ServBase) error, procs map[string]Processor) error {
+	return service.MasterSlave(configEtcd{etcds, baseLoc}, initfn, procs)
+}
+
+func (m *Service) MasterSlave(confEtcd configEtcd, initfn func(ServBase) error, procs map[string]Processor) error {
+	fun := "Service.MasterSlave -->"
+
+	args, err := m.parseFlag()
+	if err != nil {
+		slog.Panicf("%s parse arg err:%s", fun, err)
+		return err
+	}
+	args.model = MODEL_MASTERSLAVE
+
+	return m.Init(confEtcd, args, initfn, procs)
 }
 
 func Init(etcds []string, baseLoc string, servLoc, servKey, logDir string, initfn func(ServBase) error, procs map[string]Processor) error {
@@ -390,6 +484,18 @@ func GetServName() (servName string) {
 	}
 	return
 }
+
+// GetGroupAndService return group and service name of this service
+func GetGroupAndService() (group, service string) {
+	serviceKey := GetServName()
+	serviceKeyArray := strings.Split(serviceKey, "/")
+	if len(serviceKeyArray) == 2 {
+		group = serviceKeyArray[0]
+		service = serviceKeyArray[1]
+	}
+	return
+}
+
 func GetServId() (servId int) {
 	if service.sbase != nil {
 		servId = service.sbase.Servid()
@@ -397,13 +503,14 @@ func GetServId() (servId int) {
 	return
 }
 
-func Test(etcds []string, baseLoc string, initfn func(ServBase) error) error {
+func Test(etcds []string, baseLoc, servLoc string, initfn func(ServBase) error) error {
 	args := &cmdArgs{
 		logMaxSize:    0,
 		logMaxBackups: 0,
-		servLoc:       "test/test",
+		servLoc:       servLoc,
 		sessKey:       "test",
 		logDir:        "console",
+		disable:       true,
 	}
 	return service.Init(configEtcd{etcds, baseLoc}, args, initfn, nil)
 }

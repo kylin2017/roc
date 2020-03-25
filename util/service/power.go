@@ -13,6 +13,7 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/shawnfeng/sutil/slog"
 	"github.com/shawnfeng/sutil/snetutil"
+	"github.com/shawnfeng/sutil/trace"
 	"net"
 	"net/http"
 )
@@ -48,10 +49,12 @@ func powerHttp(addr string, router *httprouter.Router) (string, error) {
 	// tracing
 	mw := nethttp.Middleware(
 		opentracing.GlobalTracer(),
-		router,
+		// add logging middleware
+		httpTrafficLogMiddleware(router),
 		nethttp.OperationNameFunc(func(r *http.Request) string {
 			return "HTTP " + r.Method + ": " + r.URL.Path
-		}))
+		}),
+		nethttp.MWSpanFilter(trace.UrlSpanFilter))
 
 	go func() {
 		err := http.Serve(netListen, mw)
@@ -165,10 +168,11 @@ func powerGin(addr string, router *gin.Engine) (string, *http.Server, error) {
 	// tracing
 	mw := nethttp.Middleware(
 		opentracing.GlobalTracer(),
-		router,
+		httpTrafficLogMiddleware(router),
 		nethttp.OperationNameFunc(func(r *http.Request) string {
 			return "HTTP " + r.Method + ": " + r.URL.Path
-		}))
+		}),
+		nethttp.MWSpanFilter(trace.UrlSpanFilter))
 
 	serv := &http.Server{Handler: mw}
 	go func() {

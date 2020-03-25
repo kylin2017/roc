@@ -83,7 +83,6 @@ type ClientEtcdV2 struct {
 	breakerMutex      sync.RWMutex
 	breakerGlobalConf string
 	breakerServConf   string
-	protocol          ServProtocol
 }
 
 func checkDistVersion(client etcd.KeysAPI, prefloc, servlocation string) string {
@@ -96,30 +95,31 @@ func checkDistVersion(client etcd.KeysAPI, prefloc, servlocation string) string 
 		slog.Infof("%s check dist v2 ok path:%s", fun, path)
 		for _, n := range r.Node.Nodes {
 			for _, nc := range n.Nodes {
-				if nc.Key == n.Key+"/"+BASE_LOC_THRIFT_SERV && len(nc.Value) > 0 {
+				if nc.Key == n.Key+"/"+BASE_LOC_REG_SERV && len(nc.Value) > 0 {
 					return BASE_LOC_DIST_V2
 				}
 			}
 		}
-
 	}
 
 	slog.Warnf("%s check dist v2 path:%s err:%s", fun, path, err)
 
 	path = fmt.Sprintf("%s/%s/%s", prefloc, BASE_LOC_DIST, servlocation)
 
-	_, err = client.Get(context.Background(), path, &etcd.GetOptions{Recursive: true, Sort: false})
+	r, err = client.Get(context.Background(), path, &etcd.GetOptions{Recursive: true, Sort: false})
 	if err == nil {
 		slog.Infof("%s check dist v1 ok path:%s", fun, path)
-		return BASE_LOC_DIST
+		if len(r.Node.Nodes) > 0 {
+			return BASE_LOC_DIST
+		}
 	}
 
-	slog.Warnf("%s user v2 if check dist v1 path:%s err:%s", fun, path, err)
+	slog.Warnf("%s use v2 if check dist v1 path:%s err:%s", fun, path, err)
 
 	return BASE_LOC_DIST_V2
 }
 
-func NewClientEtcdV2(confEtcd configEtcd, servlocation string, protocol ServProtocol) (*ClientEtcdV2, error) {
+func NewClientEtcdV2(confEtcd configEtcd, servlocation string) (*ClientEtcdV2, error) {
 	//fun := "NewClientEtcdV2 -->"
 
 	cfg := etcd.Config{
@@ -149,12 +149,11 @@ func NewClientEtcdV2(confEtcd configEtcd, servlocation string, protocol ServProt
 
 		breakerServPath:   fmt.Sprintf("%s/%s/%s", confEtcd.useBaseloc, BASE_LOC_BREAKER, servlocation),
 		breakerGlobalPath: fmt.Sprintf("%s/%s", confEtcd.useBaseloc, BASE_LOC_BREAKER_GLOBAL),
-		protocol:          protocol,
 	}
 
-	cli.watch(cli.servPath, cli.parseResponse)
-	cli.watch(cli.breakerServPath, cli.handleBreakerServResponse)
-	cli.watch(cli.breakerGlobalPath, cli.handleBreakerGlobalResponse)
+	cli.watch(cli.servPath, cli.parseResponse, time.Second*5)
+	cli.watch(cli.breakerServPath, cli.handleBreakerServResponse, time.Second*60)
+	cli.watch(cli.breakerGlobalPath, cli.handleBreakerGlobalResponse, time.Second*60)
 
 	return cli, nil
 
@@ -166,9 +165,9 @@ func (m *ClientEtcdV2) startWatch(chg chan *etcd.Response, path string) {
 	for i := 0; ; i++ {
 		r, err := m.etcdClient.Get(context.Background(), path, &etcd.GetOptions{Recursive: true, Sort: false})
 		if err != nil {
-			slog.Warnf("%s get path:%s err:%s", fun, path, err)
-			//close(chg)
-			//return
+			slog.Infof("%s get path:%s err:%s", fun, path, err)
+			close(chg)
+			return
 
 		} else {
 			chg <- r
@@ -189,6 +188,7 @@ func (m *ClientEtcdV2) startWatch(chg chan *etcd.Response, path string) {
 		watcher := m.etcdClient.Watcher(path, wop)
 		if watcher == nil {
 			slog.Errorf("%s new watcher path:%s", fun, path)
+			close(chg)
 			return
 		}
 
@@ -207,13 +207,15 @@ func (m *ClientEtcdV2) startWatch(chg chan *etcd.Response, path string) {
 
 }
 
-func (m *ClientEtcdV2) watch(path string, hander func(*etcd.Response)) {
+func (m *ClientEtcdV2) watch(path string, handler func(*etcd.Response), d time.Duration) {
 	fun := "ClientEtcdV2.watch -->"
 
-	backoff := stime.NewBackOffCtrl(time.Millisecond*10, time.Second*5)
+	backoff := stime.NewBackOffCtrl(time.Millisecond*100, d)
+
+	firstSync := make(chan bool)
+	var firstOnce sync.Once
 
 	var chg chan *etcd.Response
-
 	go func() {
 		slog.Infof("%s start watch:%s", fun, path)
 		for {
@@ -225,17 +227,34 @@ func (m *ClientEtcdV2) watch(path string, hander func(*etcd.Response)) {
 
 			r, ok := <-chg
 			if !ok {
-				slog.Errorf("%s chg info nil:%s", fun, path)
 				chg = nil
+
+				firstOnce.Do(func() {
+					close(firstSync)
+				})
+
 				backoff.BackOff()
 			} else {
 				slog.Infof("%s update v:%s serv:%s", fun, r.Node.Key, path)
-				hander(r)
+				handler(r)
+
+				firstOnce.Do(func() {
+					close(firstSync)
+				})
+
 				backoff.Reset()
 			}
-
 		}
 	}()
+
+	select {
+	case <-firstSync:
+		slog.Infof("%s init ok, serv:%s", fun, path)
+		return
+	case <-time.After(time.Second):
+		slog.Warnf("%s init timeout, serv:%s", fun, path)
+		return
+	}
 }
 
 func (m *ClientEtcdV2) parseResponse(r *etcd.Response) {
@@ -330,12 +349,10 @@ func (m *ClientEtcdV2) parseResponseV2(r *etcd.Response) {
 		for _, nc := range n.Nodes {
 			slog.Infof("%s dist key:%s value:%s", fun, nc.Key, nc.Value)
 
-			if m.protocol == THRIFT && nc.Key == n.Key+"/"+BASE_LOC_THRIFT_SERV {
+			if nc.Key == n.Key+"/"+BASE_LOC_REG_SERV {
 				reg = nc.Value
 			} else if nc.Key == n.Key+"/"+BASE_LOC_REG_MANUAL {
 				manual = nc.Value
-			} else if m.protocol == GRPC && nc.Key == n.Key+"/"+BASE_LOC_GRPC_SERV {
-				reg = nc.Value
 			}
 		}
 		idServ[id] = &servCopyStr{
@@ -445,6 +462,13 @@ func (m *ClientEtcdV2) parseResponseV1(r *etcd.Response) {
 			servId: i,
 			reg: &RegData{
 				Servs: servs,
+			},
+			manual: &ManualData{
+				Ctrl: &ServCtrl{
+					Weight:  0,
+					Disable: false,
+					Groups:  []string{""},
+				},
 			},
 		}
 
